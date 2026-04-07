@@ -22,6 +22,8 @@ export interface QuarkTransferTaskResult {
   fileCount: number;
   targetPath: string;
   folderName?: string;
+  skipped?: boolean;
+  reused?: boolean;
 }
 
 const VIDEO_EXTENSIONS = [
@@ -208,12 +210,14 @@ async function fetchShareFolderItems(
 
 async function fetchDriveFolderItems(
   cookie: string,
-  pdirFid = '0'
+  pdirFid = '0',
+  page = 1,
+  size = 200
 ): Promise<any[]> {
   const query = new URLSearchParams({
     pdir_fid: pdirFid,
-    _page: '1',
-    _size: '200',
+    _page: String(page),
+    _size: String(size),
     _sort: 'file_type:asc,file_name:asc',
   });
 
@@ -228,6 +232,45 @@ async function fetchDriveFolderItems(
   const data = await parseJson(response);
   ensureOk(data, '获取夸克目录列表失败');
   return data?.data?.list || [];
+}
+
+async function fetchAllDriveFolderItems(
+  cookie: string,
+  pdirFid = '0'
+): Promise<any[]> {
+  const allItems: any[] = [];
+  const pageSize = 200;
+
+  for (let page = 1; page < 100; page += 1) {
+    const items = await fetchDriveFolderItems(cookie, pdirFid, page, pageSize);
+    allItems.push(...items);
+
+    if (items.length < pageSize) {
+      break;
+    }
+  }
+
+  return allItems;
+}
+
+function getDriveItemName(item: any): string {
+  return String(item?.file_name || item?.name || '');
+}
+
+function buildInstantPlayFolderName(pwdId: string, title?: string) {
+  const baseName = sanitizeFolderName(title || 'quark-temp') || 'quark-temp';
+  return `${baseName}_${pwdId}`.slice(0, 120);
+}
+
+async function findDirectoryByName(
+  cookie: string,
+  parentFid: string,
+  folderName: string
+): Promise<any | null> {
+  const items = await fetchAllDriveFolderItems(cookie, parentFid);
+  return items.find(
+    (item: any) => Boolean(item.dir || item.is_dir) && getDriveItemName(item) === folderName
+  ) || null;
 }
 
 export async function validateQuarkCookieReadable(cookie: string): Promise<void> {
@@ -421,7 +464,19 @@ export async function transferQuarkShare(
   const { stoken } = await fetchShareToken(safeCookie, share);
   const topLevelItems = await fetchShareFolderItems(safeCookie, share.pwdId, stoken, '0');
   const target = await ensureQuarkDrivePath(safeCookie, input.savePath);
-  const taskId = await submitSaveTask(safeCookie, share, stoken, target.fid, topLevelItems);
+  const existedItems = await fetchAllDriveFolderItems(safeCookie, target.fid);
+  const existedNames = new Set(existedItems.map((item: any) => getDriveItemName(item)));
+  const pendingItems = topLevelItems.filter((item) => !existedNames.has(item.fileName));
+
+  if (pendingItems.length === 0) {
+    return {
+      fileCount: 0,
+      targetPath: target.path,
+      skipped: true,
+    };
+  }
+
+  const taskId = await submitSaveTask(safeCookie, share, stoken, target.fid, pendingItems);
 
   if (taskId) {
     await pollTask(safeCookie, taskId);
@@ -429,7 +484,7 @@ export async function transferQuarkShare(
 
   return {
     taskId,
-    fileCount: topLevelItems.length,
+    fileCount: pendingItems.length,
     targetPath: target.path,
   };
 }
@@ -454,7 +509,18 @@ export async function createQuarkInstantPlayFolder(
   }
 
   const tempRoot = await ensureQuarkDrivePath(safeCookie, input.playTempSavePath);
-  const folderName = `${sanitizeFolderName(input.title || shareTitle || 'quark-temp')}_${Date.now()}`;
+  const folderName = buildInstantPlayFolderName(share.pwdId, input.title || shareTitle);
+  const existedFolder = await findDirectoryByName(safeCookie, tempRoot.fid, folderName);
+
+  if (existedFolder) {
+    return {
+      fileCount: videoItems.length,
+      targetPath: joinPath(tempRoot.path, folderName),
+      folderName,
+      reused: true,
+    };
+  }
+
   const folderFid = await createDriveFolder(safeCookie, tempRoot.fid, folderName);
   const taskId = await submitSaveTask(safeCookie, share, stoken, folderFid, videoItems);
 
@@ -462,10 +528,12 @@ export async function createQuarkInstantPlayFolder(
     await pollTask(safeCookie, taskId);
   }
 
+  const targetPath = joinPath(tempRoot.path, folderName);
+
   return {
     taskId,
     fileCount: videoItems.length,
-    targetPath: joinPath(tempRoot.path, folderName),
+    targetPath,
     folderName,
   };
 }

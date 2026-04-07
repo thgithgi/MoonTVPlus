@@ -50,6 +50,26 @@ export async function POST(request: NextRequest) {
       result.folderName
     );
 
+    if (
+      config.OpenListConfig?.Enabled &&
+      config.OpenListConfig.URL &&
+      config.OpenListConfig.Username &&
+      config.OpenListConfig.Password
+    ) {
+      try {
+        const { OpenListClient } = await import('@/lib/openlist.client');
+        const openListClient = new OpenListClient(
+          config.OpenListConfig.URL,
+          config.OpenListConfig.Username,
+          config.OpenListConfig.Password
+        );
+        await openListClient.refreshDirectory(quarkConfig.OpenListTempPath || '/');
+        await openListClient.refreshDirectory(openlistFolderPath);
+      } catch (refreshError) {
+        console.warn('[quark instant-play] 刷新 OpenList 临时目录失败:', refreshError);
+      }
+    }
+
     return NextResponse.json({
       success: true,
       source: 'quark-temp',

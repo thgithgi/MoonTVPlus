@@ -307,6 +307,26 @@ export async function GET(request: NextRequest) {
 
       const videoExtensions = ['.mp4', '.mkv', '.avi', '.m3u8', '.flv', '.ts', '.mov', '.wmv', '.webm', '.rmvb', '.rm', '.mpg', '.mpeg', '.3gp', '.f4v', '.m4v', '.vob'];
 
+      const listTempDirectory = async (currentPath: string, page: number, pageSize: number) => {
+        const load = async (refresh = false) => client.listDirectory(currentPath, page, pageSize, refresh);
+
+        let response = await load(page === 1);
+        if (response.code === 200) {
+          return response;
+        }
+
+        const parentPath = currentPath.substring(0, currentPath.lastIndexOf('/')) || '/';
+        await client.refreshDirectory(parentPath);
+        response = await load(true);
+
+        if (response.code !== 200) {
+          const message = response.message || '目录不存在或 OpenList 路径未映射';
+          throw new Error(`读取临时目录失败: ${message}（路径: ${currentPath}）`);
+        }
+
+        return response;
+      };
+
       const collectFiles = async (currentPath: string): Promise<Array<{ path: string; name: string }>> => {
         const allFiles: Array<{ path: string; name: string }> = [];
         let currentPage = 1;
@@ -314,10 +334,7 @@ export async function GET(request: NextRequest) {
         let hasMore = true;
 
         while (hasMore) {
-          const response = await client.listDirectory(currentPath, currentPage, pageSize);
-          if (response.code !== 200) {
-            throw new Error('读取临时目录失败');
-          }
+          const response = await listTempDirectory(currentPath, currentPage, pageSize);
 
           for (const item of response.data.content) {
             const itemPath = `${currentPath}${currentPath.endsWith('/') ? '' : '/'}${item.name}`;
