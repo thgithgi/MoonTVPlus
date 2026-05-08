@@ -1,6 +1,6 @@
 'use client';
 
-import { ChevronUp, Gauge, Headphones, Loader2, Moon, Pause, Play, SkipBack, SkipForward, Square, Sun, Volume2, Waves, X } from 'lucide-react';
+import { ChevronRight, ChevronUp, Gauge, Headphones, Loader2, Moon, Pause, Play, SkipBack, SkipForward, Square, Sun, Volume2, Waves, X } from 'lucide-react';
 import { useSearchParams } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
@@ -77,12 +77,14 @@ interface EpubRendition {
 }
 
 type ReaderTheme = 'light' | 'sepia' | 'dark';
+type ReaderMode = 'paginated' | 'scrolled';
 type FileLoadState = 'preparing' | 'checking-cache' | 'downloading' | 'opening' | 'ready';
 
 interface ReaderSettings {
   fontSize: number;
   lineHeight: number;
   theme: ReaderTheme;
+  mode: ReaderMode;
 }
 
 interface TtsChunk {
@@ -100,14 +102,24 @@ interface TtsSettings {
   autoPlayNext: boolean;
 }
 
+interface ScrolledReadingPosition {
+  href: string;
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
+  updatedAt: number;
+}
+
 type TtsStatus = 'idle' | 'loading' | 'playing' | 'paused' | 'error';
 
 const SETTINGS_STORAGE_KEY = 'books_epub_reader_settings';
+const SCROLLED_POSITION_STORAGE_KEY = 'books_epub_scrolled_positions';
 const TTS_SETTINGS_STORAGE_KEY = 'books_epub_tts_settings';
 const DEFAULT_SETTINGS: ReaderSettings = {
   fontSize: 100,
   lineHeight: 1.7,
   theme: 'light',
+  mode: 'paginated',
 };
 const DEFAULT_TTS_SETTINGS: TtsSettings = {
   voice: '',
@@ -194,6 +206,108 @@ function loadReaderSettings(): ReaderSettings {
   } catch {
     return DEFAULT_SETTINGS;
   }
+}
+
+
+function buildScrolledPositionKey(sourceId: string, bookId: string, href?: string) {
+  return `${sourceId}::${bookId}::${normalizeHrefForMatch(href)}`;
+}
+
+function loadScrolledPositions(): Record<string, ScrolledReadingPosition> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(SCROLLED_POSITION_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as Record<string, ScrolledReadingPosition>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveScrolledPosition(sourceId: string, bookId: string, position: ScrolledReadingPosition) {
+  if (typeof window === 'undefined') return;
+  const all = loadScrolledPositions();
+  all[buildScrolledPositionKey(sourceId, bookId, position.href)] = position;
+  localStorage.setItem(SCROLLED_POSITION_STORAGE_KEY, JSON.stringify(all));
+}
+
+function getScrolledPosition(sourceId: string, bookId: string, href?: string): ScrolledReadingPosition | null {
+  const all = loadScrolledPositions();
+  return all[buildScrolledPositionKey(sourceId, bookId, href)] || null;
+}
+
+function getIframeScrollMetrics(viewer: HTMLDivElement | null) {
+  if (!viewer) return null;
+
+  const iframe = viewer.querySelector('iframe');
+  const doc = iframe?.contentDocument;
+  const win = iframe?.contentWindow;
+
+  const elementCandidates = [
+    viewer,
+    ...Array.from(viewer.querySelectorAll('div')),
+  ];
+
+  let bestElement: HTMLDivElement | null = null;
+  let bestOverflow = 0;
+  for (const candidate of elementCandidates) {
+    const el = candidate as HTMLDivElement;
+    const overflow = el.scrollHeight - el.clientHeight;
+    if (overflow > bestOverflow + 8) {
+      bestOverflow = overflow;
+      bestElement = el;
+    }
+  }
+
+  const root = doc ? (doc.scrollingElement || doc.documentElement || doc.body) : null;
+  const rootOverflow = root ? Math.max((root.scrollHeight || 0) - (root.clientHeight || win?.innerHeight || 0), 0) : 0;
+
+  if (root && rootOverflow >= bestOverflow) {
+    return {
+      iframe,
+      root,
+      scrollTop: Math.max(0, win?.scrollY || root.scrollTop || 0),
+      scrollHeight: Math.max(root.scrollHeight || 0, doc?.body?.scrollHeight || 0),
+      clientHeight: root.clientHeight || win?.innerHeight || 0,
+      setScrollTop: (value: number) => {
+        if (typeof root.scrollTo === 'function') {
+          root.scrollTo({ top: value, behavior: 'auto' });
+        } else {
+          root.scrollTop = value;
+        }
+      },
+      addScrollListener: (listener: () => void) => win?.addEventListener('scroll', listener, { passive: true }),
+      removeScrollListener: (listener: () => void) => win?.removeEventListener('scroll', listener),
+      interactionTarget: root,
+    };
+  }
+
+  if (bestElement) {
+    const scrollElement = bestElement;
+    return {
+      iframe,
+      root: scrollElement,
+      scrollTop: Math.max(0, scrollElement.scrollTop || 0),
+      scrollHeight: scrollElement.scrollHeight || 0,
+      clientHeight: scrollElement.clientHeight || 0,
+      setScrollTop: (value: number) => {
+        scrollElement.scrollTo({ top: value, behavior: 'auto' });
+      },
+      addScrollListener: (listener: () => void) => scrollElement.addEventListener('scroll', listener, { passive: true }),
+      removeScrollListener: (listener: () => void) => scrollElement.removeEventListener('scroll', listener),
+      interactionTarget: scrollElement,
+    };
+  }
+
+  return null;
+}
+
+function computeScrolledTargetScrollTop(position: ScrolledReadingPosition, currentScrollHeight: number, currentClientHeight: number) {
+  const maxSaved = Math.max(0, position.scrollHeight - position.clientHeight);
+  const maxCurrent = Math.max(0, currentScrollHeight - currentClientHeight);
+  if (maxCurrent <= 0) return 0;
+  if (maxSaved <= 0) return Math.min(position.scrollTop, maxCurrent);
+  const ratio = Math.max(0, Math.min(1, position.scrollTop / maxSaved));
+  return ratio * maxCurrent;
 }
 
 function flattenToc(items: TocItem[]): TocItem[] {
@@ -379,6 +493,25 @@ function chunkTtsText(text: string, maxChars: number): TtsChunk[] {
   return chunks;
 }
 
+
+function getRenditionOptions(mode: ReaderMode) {
+  return mode === 'scrolled'
+    ? {
+        width: '100%',
+        height: '100%',
+        spread: 'none',
+        manager: 'default',
+        flow: 'scrolled-doc',
+      }
+    : {
+        width: '100%',
+        height: '100%',
+        spread: 'none',
+        manager: 'default',
+        flow: 'paginated',
+      };
+}
+
 function decodeBase64Audio(base64: string, mimeType: string) {
   const binary = typeof window === 'undefined' ? '' : window.atob(base64);
   const bytes = new Uint8Array(binary.length);
@@ -425,7 +558,17 @@ export default function BookReadPage() {
   const [ttsDuration, setTtsDuration] = useState(0);
   const [ttsSeekValue, setTtsSeekValue] = useState(0);
   const [ttsSeeking, setTtsSeeking] = useState(false);
+  const [scrolledBottomReached, setScrolledBottomReached] = useState(false);
   const viewerRef = useRef<HTMLDivElement | null>(null);
+  const pendingScrolledRestoreRef = useRef<ScrolledReadingPosition | null>(null);
+  const restoreTargetRef = useRef<string | undefined>(undefined);
+  const scrollListenerCleanupRef = useRef<(() => void) | null>(null);
+  const scrolledAutoAdvanceLockRef = useRef(false);
+  const scrolledTouchStartYRef = useRef<number | null>(null);
+  const scrolledBottomReachedRef = useRef(false);
+  const nextChapterHrefRef = useRef('');
+  const bindScrolledIframeListenerRef = useRef<() => void>(() => undefined);
+  const applyPendingScrolledRestoreRef = useRef<() => void>(() => undefined);
   const tocScrollRef = useRef<HTMLDivElement | null>(null);
   const tocItemRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const bookRef = useRef<EpubBookInstance | null>(null);
@@ -434,10 +577,12 @@ export default function BookReadPage() {
   const pendingRecordDirtyRef = useRef(false);
   const saveInFlightRef = useRef(false);
   const lastLocationRef = useRef<EpubLocation | null>(null);
+  const settingsRef = useRef<ReaderSettings>(DEFAULT_SETTINGS);
   const lastProgressRef = useRef(0);
   const lastChapterRef = useRef('');
   const locationsReadyRef = useRef(false);
   const tocItemsRef = useRef<TocItem[]>([]);
+  const currentHrefRef = useRef('');
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const ttsChunkAudioUrlRef = useRef<Record<number, string>>({});
   const ttsChunkBlobCacheRef = useRef<Record<number, { url: string; text: string }>>({});
@@ -458,6 +603,7 @@ export default function BookReadPage() {
   }, []);
 
   useEffect(() => {
+    settingsRef.current = settings;
     if (typeof window !== 'undefined') {
       localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
     }
@@ -475,11 +621,19 @@ export default function BookReadPage() {
   }, [ttsStatus]);
 
   useEffect(() => {
+    currentHrefRef.current = currentHref;
+  }, [currentHref]);
+
+  useEffect(() => {
     ttsSeekingRef.current = ttsSeeking;
     if (!ttsSeeking) {
       setTtsSeekValue(ttsCurrentTime);
     }
   }, [ttsCurrentTime, ttsSeeking]);
+
+  useEffect(() => {
+    scrolledBottomReachedRef.current = scrolledBottomReached;
+  }, [scrolledBottomReached]);
 
 
   useEffect(() => {
@@ -634,12 +788,51 @@ export default function BookReadPage() {
     }
   }, []);
 
+
+  const persistScrolledPosition = useCallback((fallbackHref?: string) => {
+    if (!manifest || settingsRef.current.mode !== 'scrolled') return;
+    const metrics = getIframeScrollMetrics(viewerRef.current);
+    const href = fallbackHref || currentHrefRef.current || lastLocationRef.current?.start?.href || '';
+    if (!metrics || !href) return;
+    saveScrolledPosition(manifest.book.sourceId, manifest.book.id, {
+      href,
+      scrollTop: metrics.scrollTop,
+      scrollHeight: metrics.scrollHeight,
+      clientHeight: metrics.clientHeight,
+      updatedAt: Date.now(),
+    });
+  }, [manifest]);
+
+
+  const applyPendingScrolledRestore = useCallback(() => {
+    if (settingsRef.current.mode !== 'scrolled') return;
+    const pending = pendingScrolledRestoreRef.current;
+    if (!pending) return;
+    const metrics = getIframeScrollMetrics(viewerRef.current);
+    if (!metrics) return;
+    const currentHrefValue = lastLocationRef.current?.start?.href || currentHrefRef.current;
+    if (!currentHrefValue || !isSameTocTarget(currentHrefValue, pending.href)) return;
+    const targetScrollTop = computeScrolledTargetScrollTop(pending, metrics.scrollHeight, metrics.clientHeight);
+    metrics.setScrollTop(targetScrollTop);
+    pendingScrolledRestoreRef.current = null;
+  }, []);
+
+
+
+
+
+
+  useEffect(() => {
+    applyPendingScrolledRestoreRef.current = applyPendingScrolledRestore;
+  }, [applyPendingScrolledRestore]);
+
   const persistCurrentProgress = useCallback(() => {
     if (lastLocationRef.current) {
       queueReadRecord(lastLocationRef.current, lastProgressRef.current, lastChapterRef.current);
     }
+    persistScrolledPosition();
     void flushPendingReadRecord();
-  }, [queueReadRecord, flushPendingReadRecord]);
+  }, [queueReadRecord, persistScrolledPosition, flushPendingReadRecord]);
 
   const applyReaderTheme = useCallback((nextSettings: ReaderSettings) => {
     const rendition = renditionRef.current;
@@ -672,17 +865,17 @@ export default function BookReadPage() {
 
   const handleReaderTap = useCallback((zone: 'left' | 'center' | 'right') => {
     if (!ready) return;
-    if (zone === 'left') {
+    if (settings.mode === 'paginated' && zone === 'left') {
       renditionRef.current?.prev?.();
       return;
     }
-    if (zone === 'right') {
+    if (settings.mode === 'paginated' && zone === 'right') {
       renditionRef.current?.next?.();
       return;
     }
     setTocOpen(false);
     setSettingsOpen(false);
-  }, [ready]);
+  }, [ready, settings.mode]);
 
   const cleanupTtsAudioUrls = useCallback(() => {
     Object.values(ttsChunkBlobCacheRef.current).forEach((item) => URL.revokeObjectURL(item.url));
@@ -927,15 +1120,26 @@ export default function BookReadPage() {
   useEffect(() => {
     if (!manifest || manifest.format !== 'epub' || !viewerRef.current) return;
     let destroyed = false;
+    const currentSessionCfi = lastLocationRef.current?.start?.cfi || undefined;
+    const currentSessionHref = currentHrefRef.current || lastLocationRef.current?.start?.href || undefined;
+
     setReady(false);
     setRestoredMessage('');
     locationsReadyRef.current = false;
+    lastLocationRef.current = null;
     setProgressPercent(manifest.lastRecord?.progressPercent || 0);
     setCurrentChapter(manifest.lastRecord?.chapterTitle || manifest.lastRecord?.locator?.chapterTitle || '');
     setFileLoadState('checking-cache');
     setDownloadedBytes(0);
     setTotalBytes(null);
     setCacheHit(false);
+
+    const initialScrolledHref = currentSessionHref || manifest.lastRecord?.chapterHref || manifest.lastRecord?.locator?.href || undefined;
+    const cachedScrolledPosition = initialScrolledHref ? getScrolledPosition(manifest.book.sourceId, manifest.book.id, initialScrolledHref) : null;
+    pendingScrolledRestoreRef.current = settings.mode === 'scrolled' && !currentSessionHref ? cachedScrolledPosition : null;
+    restoreTargetRef.current = settings.mode === 'scrolled'
+      ? (initialScrolledHref || cachedScrolledPosition?.href || undefined)
+      : (currentSessionCfi || manifest.lastRecord?.locator?.value || undefined);
 
     loadEpubScript()
       .then(async () => {
@@ -992,18 +1196,12 @@ export default function BookReadPage() {
           }
         }, 4000);
 
-        const rendition = book.renderTo(viewerRef.current, {
-          width: '100%',
-          height: '100%',
-          spread: 'none',
-          manager: 'default',
-          flow: 'paginated',
-        });
+        const rendition = book.renderTo(viewerRef.current, getRenditionOptions(settings.mode));
         bookRef.current = book;
         renditionRef.current = rendition;
-        applyReaderTheme(settings);
+        applyReaderTheme(settingsRef.current);
 
-        const restoreTarget = manifest.lastRecord?.locator?.value || undefined;
+        const restoreTarget = restoreTargetRef.current;
         let restoreMessageShown = false;
 
         rendition.on('relocated', (location: EpubLocation) => {
@@ -1018,6 +1216,12 @@ export default function BookReadPage() {
             window.setTimeout(() => setRestoredMessage(''), 3000);
           }
           lastLocationRef.current = location;
+          scrolledAutoAdvanceLockRef.current = false;
+          setScrolledBottomReached(false);
+          window.requestAnimationFrame(() => {
+            bindScrolledIframeListenerRef.current();
+            applyPendingScrolledRestoreRef.current();
+          });
           const hrefLabel = location?.start?.href ? findTocLabelByHref(tocItemsRef.current, location.start.href) : '';
           const chapterTitle = hrefLabel || location?.start?.displayed?.chapter || location?.start?.href || manifest.book.title;
           const cfi = location?.start?.cfi || '';
@@ -1072,11 +1276,13 @@ export default function BookReadPage() {
 
     return () => {
       destroyed = true;
+      scrollListenerCleanupRef.current?.();
+      scrollListenerCleanupRef.current = null;
       persistCurrentProgress();
       renditionRef.current?.destroy?.();
       bookRef.current?.destroy?.();
     };
-  }, [manifest, settings, applyReaderTheme, persistCurrentProgress, queueReadRecord, navigateToTarget]);
+  }, [manifest, settings.mode, applyReaderTheme, persistCurrentProgress, queueReadRecord, navigateToTarget]);
 
   useEffect(() => {
     const flushPendingReadRecordOnLeave = () => {
@@ -1236,11 +1442,11 @@ export default function BookReadPage() {
     window.dispatchEvent(new CustomEvent('books-read-update-header', {
       detail: {
         title: manifest.book.title,
-        subtitle: currentTocLabel || currentChapter || manifest.book.author || '分页阅读',
+        subtitle: currentTocLabel || currentChapter || manifest.book.author || (settings.mode === 'scrolled' ? '滚动阅读' : '分页阅读'),
         backHref: `/books/detail?sourceId=${encodeURIComponent(manifest.book.sourceId)}&bookId=${encodeURIComponent(manifest.book.id)}`,
       },
     }));
-  }, [manifest, currentChapter, currentTocLabel]);
+  }, [manifest, currentChapter, currentTocLabel, settings.mode]);
 
   useEffect(() => {
     if (!tocOpen || !activeTocHref) return;
@@ -1248,6 +1454,142 @@ export default function BookReadPage() {
     if (!activeNode) return;
     activeNode.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }, [tocOpen, activeTocHref]);
+  const nextChapterHref = useMemo(() => {
+    const index = flatToc.findIndex((item) => isSameTocTarget(currentHref, item.href));
+    if (index < 0) return flatToc[0]?.href || '';
+    return flatToc[index + 1]?.href || '';
+  }, [flatToc, currentHref]);
+
+  useEffect(() => {
+    nextChapterHrefRef.current = nextChapterHref;
+  }, [nextChapterHref]);
+
+  const goToNextChapter = useCallback(() => {
+    if (!nextChapterHref) return;
+    persistScrolledPosition();
+    pendingScrolledRestoreRef.current = {
+      href: nextChapterHref,
+      scrollTop: 0,
+      scrollHeight: 1,
+      clientHeight: 1,
+      updatedAt: Date.now(),
+    };
+    restoreTargetRef.current = nextChapterHref;
+    scrolledAutoAdvanceLockRef.current = true;
+    setScrolledBottomReached(false);
+    void navigateToTarget(nextChapterHref);
+  }, [nextChapterHref, navigateToTarget, persistScrolledPosition]);
+  const bindScrolledIframeListener = useCallback(() => {
+    scrollListenerCleanupRef.current?.();
+    scrollListenerCleanupRef.current = null;
+    if (settingsRef.current.mode !== 'scrolled') return;
+
+    let retryTimer = 0;
+    let rafId = 0;
+
+    const attach = () => {
+      const metrics = getIframeScrollMetrics(viewerRef.current);
+      if (!metrics) {
+        retryTimer = window.setTimeout(attach, 120);
+        return;
+      }
+
+      const isAtBottom = () => {
+        const latestMetrics = getIframeScrollMetrics(viewerRef.current);
+        if (!latestMetrics) return false;
+        const distanceToBottom = latestMetrics.scrollHeight - latestMetrics.clientHeight - latestMetrics.scrollTop;
+        return distanceToBottom <= 36;
+      };
+
+      const setBottomReached = (value: boolean) => {
+        if (scrolledBottomReachedRef.current === value) return;
+        scrolledBottomReachedRef.current = value;
+        setScrolledBottomReached(value);
+      };
+
+      const handleAdvanceIntent = () => {
+        if (!nextChapterHrefRef.current) return;
+        if (!isAtBottom()) return;
+        if (!scrolledBottomReachedRef.current) {
+          setBottomReached(true);
+          return;
+        }
+        if (scrolledAutoAdvanceLockRef.current) return;
+        goToNextChapter();
+      };
+
+      const handleScroll = () => {
+        if (rafId) window.cancelAnimationFrame(rafId);
+        rafId = window.requestAnimationFrame(() => {
+          const latestMetrics = getIframeScrollMetrics(viewerRef.current);
+          if (!latestMetrics) return;
+          persistScrolledPosition();
+          const distanceToBottom = latestMetrics.scrollHeight - latestMetrics.clientHeight - latestMetrics.scrollTop;
+          if (distanceToBottom <= 36) {
+            setBottomReached(true);
+            scrolledAutoAdvanceLockRef.current = false;
+            return;
+          }
+          setBottomReached(false);
+          scrolledAutoAdvanceLockRef.current = false;
+        });
+      };
+
+      const handleWheel = (event: Event) => {
+        const wheel = event as WheelEvent;
+        if (wheel.deltaY > 24) handleAdvanceIntent();
+      };
+
+      const handleTouchStart = (event: Event) => {
+        const touch = (event as TouchEvent).touches[0];
+        scrolledTouchStartYRef.current = touch?.clientY ?? null;
+      };
+
+      const handleTouchMove = (event: Event) => {
+        const touch = (event as TouchEvent).touches[0];
+        const startY = scrolledTouchStartYRef.current;
+        if (touch && startY !== null && startY - touch.clientY > 28) {
+          handleAdvanceIntent();
+          scrolledTouchStartYRef.current = touch.clientY;
+        }
+      };
+
+      const handleTouchEnd = () => {
+        scrolledTouchStartYRef.current = null;
+      };
+
+      metrics.addScrollListener(handleScroll);
+      metrics.interactionTarget?.addEventListener('wheel', handleWheel, { passive: true });
+      metrics.interactionTarget?.addEventListener('touchstart', handleTouchStart, { passive: true });
+      metrics.interactionTarget?.addEventListener('touchmove', handleTouchMove, { passive: true });
+      metrics.interactionTarget?.addEventListener('touchend', handleTouchEnd, { passive: true });
+      viewerRef.current?.addEventListener('wheel', handleWheel, { passive: true });
+      viewerRef.current?.addEventListener('touchstart', handleTouchStart, { passive: true });
+      viewerRef.current?.addEventListener('touchmove', handleTouchMove, { passive: true });
+      viewerRef.current?.addEventListener('touchend', handleTouchEnd, { passive: true });
+      handleScroll();
+      scrollListenerCleanupRef.current = () => {
+        if (retryTimer) window.clearTimeout(retryTimer);
+        if (rafId) window.cancelAnimationFrame(rafId);
+        metrics.removeScrollListener(handleScroll);
+        metrics.interactionTarget?.removeEventListener('wheel', handleWheel);
+        metrics.interactionTarget?.removeEventListener('touchstart', handleTouchStart);
+        metrics.interactionTarget?.removeEventListener('touchmove', handleTouchMove);
+        metrics.interactionTarget?.removeEventListener('touchend', handleTouchEnd);
+        viewerRef.current?.removeEventListener('wheel', handleWheel);
+        viewerRef.current?.removeEventListener('touchstart', handleTouchStart);
+        viewerRef.current?.removeEventListener('touchmove', handleTouchMove);
+        viewerRef.current?.removeEventListener('touchend', handleTouchEnd);
+      };
+    };
+
+    attach();
+  }, [goToNextChapter, persistScrolledPosition]);
+
+
+  useEffect(() => {
+    bindScrolledIframeListenerRef.current = bindScrolledIframeListener;
+  }, [bindScrolledIframeListener]);
 
   const renderTocItems = useCallback((items: TocItem[], depth = 0) => items.map((item) => {
     const active = tocItemIsActive(item, currentHref);
@@ -1260,6 +1602,15 @@ export default function BookReadPage() {
           }}
           onClick={() => {
             if (!clickable) return;
+            persistScrolledPosition();
+            pendingScrolledRestoreRef.current = {
+              href: item.href,
+              scrollTop: 0,
+              scrollHeight: 1,
+              clientHeight: 1,
+              updatedAt: Date.now(),
+            };
+            restoreTargetRef.current = item.href;
             void navigateToTarget(item.href);
             setTocOpen(false);
           }}
@@ -1275,7 +1626,11 @@ export default function BookReadPage() {
         {item.subitems?.length ? renderTocItems(item.subitems, depth + 1) : null}
       </div>
     );
-  }), [currentHref, navigateToTarget]);
+  }), [currentHref, navigateToTarget, persistScrolledPosition]);
+
+
+
+  const showScrolledNextChapter = ready && settings.mode === 'scrolled' && !tocOpen && !settingsOpen && scrolledBottomReached && !!nextChapterHref;
 
   const progressLabel = totalBytes ? `${formatBytes(downloadedBytes)} / ${formatBytes(totalBytes)}` : formatBytes(downloadedBytes);
   const ttsChunkPercent = ttsChunks.length > 0 ? ((ttsCurrentChunkIndex + 1) / ttsChunks.length) * 100 : 0;
@@ -1295,15 +1650,15 @@ export default function BookReadPage() {
   }
 
   return (
-    <div className='relative h-[calc(100vh-3.5rem)] overflow-hidden bg-white dark:bg-gray-950'>
+    <div className='flex h-[calc(100vh-3.5rem)] flex-col bg-white dark:bg-gray-950'>
       {restoredMessage ? (
-        <div className='absolute left-1/2 top-4 z-30 -translate-x-1/2 rounded-full bg-sky-600 px-4 py-2 text-xs text-white shadow-lg'>
+        <div className='absolute left-1/2 top-[4.5rem] z-30 -translate-x-1/2 rounded-full bg-sky-600 px-4 py-2 text-xs text-white shadow-lg'>
           {restoredMessage}
         </div>
       ) : null}
 
       {!ready ? (
-        <div className='absolute inset-x-0 top-0 z-10 p-4'>
+        <div className='absolute inset-x-0 top-[3.5rem] z-10 p-4'>
           <div className='mx-auto max-w-3xl space-y-4'>
             <div className='space-y-2 rounded-3xl border border-gray-200 bg-white/90 p-5 shadow-sm dark:border-gray-800 dark:bg-gray-950/90'>
               <div className='text-sm font-medium text-gray-700 dark:text-gray-300'>
@@ -1365,9 +1720,28 @@ export default function BookReadPage() {
           >
             <div className='mb-4'>
               <div className='text-base font-semibold text-gray-900 dark:text-gray-100'>阅读设置</div>
-              <div className='mt-1 text-xs text-gray-500'>分页式 EPUB 阅读设置</div>
+              <div className='mt-1 text-xs text-gray-500'>可切换翻页或滚动阅读，默认翻页模式</div>
             </div>
             <div className='space-y-6 p-1 text-sm'>
+              <div>
+                <div className='mb-2 font-medium'>阅读模式</div>
+                <div className='grid grid-cols-2 gap-2'>
+                  {([
+                    { key: 'paginated', label: '翻页模式', desc: '左右点击翻页' },
+                    { key: 'scrolled', label: '滚动模式', desc: '上下连续滚动' },
+                  ] as { key: ReaderMode; label: string; desc: string }[]).map((mode) => (
+                    <button
+                      key={mode.key}
+                      onClick={() => setSettings((prev) => ({ ...prev, mode: mode.key }))}
+                      className={`rounded-2xl border px-3 py-3 text-left ${settings.mode === mode.key ? 'border-sky-500 bg-sky-50 text-sky-700 dark:bg-sky-950/30 dark:text-sky-300' : 'border-gray-200 dark:border-gray-700'}`}
+                    >
+                      <div className='font-medium'>{mode.label}</div>
+                      <div className='mt-1 text-xs opacity-70'>{mode.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <div>
                 <div className='mb-2 font-medium'>主题</div>
                 <div className='grid grid-cols-3 gap-2'>
@@ -1659,7 +2033,7 @@ export default function BookReadPage() {
       ) : null}
 
 
-      {ready && !tocOpen && !settingsOpen ? (
+      {ready && !tocOpen && !settingsOpen && settings.mode === 'paginated' ? (
         <>
           <button
             aria-label='上一页'
@@ -1674,7 +2048,25 @@ export default function BookReadPage() {
         </>
       ) : null}
 
-      <div ref={viewerRef} className='h-full w-full' style={{ backgroundColor: THEME_STYLES[settings.theme].panelBg }} />
+      <div
+        ref={viewerRef}
+        className='relative min-h-0 flex-1 w-full'
+        style={{ backgroundColor: THEME_STYLES[settings.theme].panelBg }}
+        onClick={() => handleReaderTap('center')}
+      />
+
+      {showScrolledNextChapter ? (
+        <div className='pointer-events-none fixed bottom-5 right-4 z-30'>
+          <button
+            type='button'
+            onClick={goToNextChapter}
+            aria-label='下一章'
+            className='pointer-events-auto flex h-11 w-11 items-center justify-center rounded-full bg-sky-600/20 text-white shadow-lg'
+          >
+            <ChevronRight className='h-5 w-5' />
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }
